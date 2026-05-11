@@ -1,13 +1,14 @@
-"""Initial schema: user_preferences, templates, notifications, deliveries.
+"""Full schema: user_preferences, templates, notifications, deliveries.
 
 Revision ID: 0001_initial_schema
 Revises:
 Create Date: 2026-05-11 00:00:00
 
-WHY a hand-written initial migration (instead of `alembic revision --autogenerate`):
-  - Reproducible at exam time without needing a live DB to introspect.
-  - Mirrors `app/models/*.py` exactly. The autogenerate flow remains
-    available for future schema changes.
+Single consolidated migration representing the final schema:
+  - user_preferences with per-channel addresses and version_id (OCC)
+  - templates with version_id (OCC)
+  - notifications without template_id (resolved at dispatch time)
+  - deliveries
 """
 from __future__ import annotations
 
@@ -56,6 +57,15 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("false"),
         ),
+        sa.Column("email_address", sa.String(length=320), nullable=True),
+        sa.Column("phone_number", sa.String(length=32), nullable=True),
+        sa.Column("device_token", sa.String(length=4096), nullable=True),
+        sa.Column(
+            "version_id",
+            sa.Integer(),
+            nullable=False,
+            server_default="1",
+        ),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     )
@@ -74,6 +84,12 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("true"),
         ),
+        sa.Column(
+            "version_id",
+            sa.Integer(),
+            nullable=False,
+            server_default="1",
+        ),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     )
@@ -87,6 +103,8 @@ def upgrade() -> None:
     )
 
     # --- notifications ----------------------------------------------------
+    # No template_id: the dispatcher resolves the active Template by
+    # (notification_type, channel) at delivery time (see DECISIONS.md §1).
     op.create_table(
         "notifications",
         sa.Column(
@@ -103,12 +121,6 @@ def upgrade() -> None:
         sa.Column("recipient_contact", sa.String(length=512), nullable=True),
         sa.Column("notification_type", sa.String(length=128), nullable=False),
         sa.Column("content", sa.Text(), nullable=True),
-        sa.Column(
-            "template_id",
-            sa.Integer(),
-            sa.ForeignKey("templates.id", ondelete="SET NULL"),
-            nullable=True,
-        ),
         sa.Column(
             "variables",
             postgresql.JSONB(astext_type=sa.Text()),

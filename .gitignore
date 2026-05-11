@@ -21,7 +21,6 @@ build/
 *.log
 
 # Local docs - not for repo
-PRD.md
 mid-senior-notification-service.md
 mid-senior-notification-service.pdf
 INTERVIEW_PREP.md

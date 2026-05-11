@@ -35,7 +35,7 @@ The notification service MUST:
 ### 1.4 Nice to Have (Stretch)
 - [x] Frequency caps.
 - [x] Delivery analytics/stats endpoint.
-- [ ] Batch send (multiple recipients).
+- [x] Batch send (multiple recipients).
 - [x] Priority queues (high priority processed first).
 
 ---
@@ -349,8 +349,8 @@ your-project/
 - [x] **Be explicit about simplifications** — honesty is valued.
 
 ### 7.7 Evaluation Criteria (What Reviewers Will Probe)
-- [ ] Understanding of **delivery guarantees and failure handling**.
-- [ ] Clean **abstraction for multiple channels**.
-- [ ] Ability to **recognize subtly incorrect AI advice**.
-- [ ] Ability to **explain trade-offs** in the design.
-- [ ] Be ready in a follow-up interview to explain architecture and answer "what if" scenarios — deeply understand your own solution.
+- [x] Understanding of **delivery guarantees and failure handling**.
+- [x] Clean **abstraction for multiple channels**.
+- [x] Ability to **recognize subtly incorrect AI advice**.
+- [x] Ability to **explain trade-offs** in the design.
+- [x] Be ready in a follow-up interview to explain architecture and answer "what if" scenarios — deeply understand your own solution.

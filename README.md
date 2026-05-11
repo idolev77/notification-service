@@ -15,7 +15,7 @@ Built end-to-end against the take-home spec in `mid-senior-notification-service.
 ### Boot the entire stack
 
 ```bash
-cp .env.example .env
+cp .env.example .env          # required — edit values as needed
 docker compose up --build
 ```
 
@@ -43,6 +43,23 @@ OpenAPI docs: `http://localhost:8000/docs`.
 ```bash
 docker compose down -v   # -v drops the Postgres volume too
 ```
+
+### Configuration
+
+All tunables live in `.env` (copied from `.env.example`). Key variables:
+
+| Variable | Default | Purpose |
+| -------- | ------- | ------- |
+| `MAX_RETRY_ATTEMPTS` | `5` | Max retries per Delivery before PERMANENTLY_FAILED |
+| `RETRY_BACKOFF_BASE_SECONDS` | `2` | Base for exponential backoff (doubles each retry, jittered) |
+| `FREQUENCY_CAP_HIGH_PRIORITY_BYPASS` | `true` | High-priority notifications bypass frequency caps |
+| `SCHEDULED_SCAN_INTERVAL_SECONDS` | `30` | How often Celery Beat polls for due scheduled notifications |
+| `EMAIL_BOUNCE_RATE` | `0.05` | Fraction of email sends that simulate a hard bounce |
+| `EMAIL_TRANSIENT_FAILURE_RATE` | `0.05` | Fraction of email sends that simulate a retryable transient error |
+| `SMS_TRANSIENT_FAILURE_RATE` | `0.05` | Fraction of SMS sends that simulate a retryable carrier error |
+| `WEBHOOK_TRANSIENT_FAILURE_RATE` | `0.05` | Fraction of webhook POSTs that simulate a retryable 5xx |
+| `DEFAULT_FREQUENCY_CAP_PER_HOUR` | `0` | Global default hourly cap (`0` = disabled) |
+| `DEFAULT_FREQUENCY_CAP_PER_DAY` | `0` | Global default daily cap (`0` = disabled) |
 
 ---
 
@@ -177,14 +194,59 @@ curl "http://localhost:8000/stats/deliveries?since=2026-01-01T00:00:00Z"
 
 ### 3.7 Resend failed deliveries (management)
 
+Resend re-enqueues every `Delivery` in state `failed` or `permanently_failed` for the given notification. Attempt counts are **reset to 0** so the full retry budget (`MAX_RETRY_ATTEMPTS`) is available again. Frequency caps are **not re-evaluated** — the original send already consumed the cap slot. Returns `202` with the list of re-queued `Delivery` objects.
+
 ```bash
 curl -X POST http://localhost:8000/notifications/<id>/resend
-# 202 Accepted with the list of re-enqueued deliveries
+# 202 Accepted
+# [{"id": "…", "channel": "email", "status": "queued", …}, …]
 ```
 
-### 3.8 Pause / resume a user
+### 3.8 Batch send (multiple recipients)
 
-Pause/resume is a flip on `UserPreferences.is_paused` via the same `PUT` route as §3.1.
+Fan-out the same notification to N recipients. Each recipient produces an independent `Notification` (so per-user preferences, quiet hours and frequency caps still apply). Per-recipient `variables` shallow-merge over batch-level `variables`. Failures are **isolated per recipient** — the response is `207 Multi-Status` with one result row per recipient.
+
+```bash
+curl -X POST http://localhost:8000/notifications/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "notification_type": "welcome",
+    "content": "Hello {{user.name}}",
+    "variables": {"campaign": "spring2026"},
+    "priority": "normal",
+    "recipients": [
+      {"recipient_user_id": "u1", "variables": {"user": {"name": "Ada"}}},
+      {"recipient_user_id": "u2", "variables": {"user": {"name": "Linus"}}},
+      {"recipient_contact": "guest@example.com", "variables": {"user": {"name": "Guest"}}}
+    ]
+  }'
+# 207 Multi-Status
+# {
+#   "accepted": 3,
+#   "failed":   0,
+#   "results": [
+#     {"index": 0, "recipient_user_id": "u1", "notification_id": "…", "status": "processing"},
+#     {"index": 1, "recipient_user_id": "u2", "notification_id": "…", "status": "processing"},
+#     {"index": 2, "recipient_contact": "guest@example.com", "notification_id": "…", "status": "processing"}
+#   ]
+# }
+```
+
+### 3.9 Pause / resume a user
+
+Dedicated management endpoints toggle `is_paused` without touching any other preference field.
+
+```bash
+# Pause — all subsequent notifications for u1 are silently dropped
+curl -X POST http://localhost:8000/users/u1/pause
+# 200 OK — returns full UserPreferencesResponse with is_paused=true
+
+# Resume
+curl -X POST http://localhost:8000/users/u1/resume
+# 200 OK — returns full UserPreferencesResponse with is_paused=false
+```
+
+> **Note:** `channels_override` requests bypass the paused check (it is an admin/security escape hatch). All other sends for a paused user return no deliveries and the notification is marked `completed` with `filtered_by_pause=true` in the structured log.
 
 ---
 

@@ -1,8 +1,5 @@
 # Design Decisions
 
-> Placeholder — sections will be filled progressively across sprints and
-> finalized in Sprint 5. Skeleton kept verbatim per PRD §7.3.
-
 ## 1. Channel Abstraction Design
 
 **Approach chosen:** A `ChannelProvider` Abstract Base Class (`app/channels/base.py`) with two required methods — `validate_address(address)` and `send(payload) -> SendOutcome` — plus a class-level `channel_type` attribute. Concrete providers self-register via the `@register_provider` decorator (`app/channels/registry.py`); the dispatcher resolves them via `get_provider(channel)`.
@@ -18,6 +15,8 @@
 2. Decorate the subclass with `@register_provider`.
 3. Add the channel name to the worker's `-Q` list in `docker-compose.yml`.
 4. (Optional) add channel-specific config fields to `Settings`.
+
+**Note on extended status enumerations:** The PRD §2 lists `NotificationStatus` as `{received, processing, completed, failed}` and `DeliveryStatus` as `{queued, sending, delivered, failed}`. The implementation extends both enums with two additional states required by other PRD sections: `NotificationStatus.CANCELLED` (required by §3.5 — cancel scheduled notification) and `DeliveryStatus.PERMANENTLY_FAILED` + `DeliveryStatus.CANCELLED` (required by §4.1 — lifecycle must distinguish exhausted retries from transient failures). These extensions are additive and backwards-compatible; the PRD §2 states are a subset.
 
 ---
 
@@ -66,7 +65,7 @@ After every TX2 the parent Notification's status is recomputed (PROCESSING / COM
 2. **Missing prefs / paused user** (PRD §3.5) — return empty channel list; notification is marked `COMPLETED` with `filtered_by_pause=true` in the structured log. Not a 4xx — the API call itself was valid.
 3. **Global `enabled_channels`** — start from this allow-list. An empty list means "user has not opted in to any channel" → no deliveries.
 4. **`per_type_preferences[notification_type]` (intersection only)** — if set, narrow the candidate list to `enabled_channels ∩ per_type`. Per-type preferences narrow; they NEVER widen. This prevents an old per-type entry from re-enabling a globally disabled channel.
-5. **Quiet hours** (PRD §4.3) — if "now" (in `quiet_hours_timezone`) falls inside `[start, end)`, drop ALL channels UNLESS the notification has `priority=HIGH`. Wrap-around (e.g. 22:00→07:00) is handled. `start == end` is treated as "always quiet" (24h block) — documented choice.
+5. **Quiet hours** (PRD §4.3) — if "now" (in `quiet_hours_timezone`) falls inside `[start, end)`, drop ALL channels UNLESS the notification has `priority=HIGH`. Wrap-around (e.g. 22:00→07:00) is handled correctly: when `start > end`, the window spans midnight, and a time is inside if it is `>= start` OR `< end`. **Edge case: `start == end`** is treated as "always quiet" (a 24-hour block), not as "no quiet hours". Callers who want to disable quiet hours should either omit the fields entirely or set `quiet_hours_start=null`. Setting both to the same value is an intentional "block all" configuration.
 6. **Frequency caps** (PRD §4.6) — fixed-window counters in Redis (`freqcap:{user_id}:{window}:{bucket_id}`, TTL = window length). Caps are evaluated AFTER quiet hours so the simpler check happens first. **HIGH priority bypasses caps** when `FREQUENCY_CAP_HIGH_PRIORITY_BYPASS=true` (default), mirroring the quiet-hours bypass — both flags express "this is operationally critical". Cap state is **best-effort, fail-open**: a Redis outage does NOT block delivery, it just disables enforcement and emits a `freqcap.redis_unavailable` warning. Trade-off: fixed-window allows up to `2*N` deliveries across a `2*window` boundary; documented and accepted as the price of O(1) checks. Capped notifications are **dropped** (not queued) — queueing them would defeat the purpose of the cap (smoothing user-facing volume) and queueing-with-deferral overlaps with §4.8 scheduling.
 7. **Webhook URL gate** — `WEBHOOK` is dropped (with a `preferences.webhook_dropped_no_url` log) if the user has no `webhook_url` configured, since shipping a webhook delivery without a destination is unrecoverable.
 

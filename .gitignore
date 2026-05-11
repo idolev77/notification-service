@@ -19,3 +19,10 @@ build/
 .idea/
 .vscode/
 *.log
+
+# Local docs - not for repo
+PRD.md
+mid-senior-notification-service.md
+mid-senior-notification-service.pdf
+INTERVIEW_PREP.md
+INTERVIEW_PREP_HE.md

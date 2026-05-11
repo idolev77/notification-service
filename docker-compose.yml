@@ -1,0 +1,126 @@
+# ---------------------------------------------------------------------------
+# Notification Service - Local & CI Orchestration
+# ---------------------------------------------------------------------------
+# Services:
+#   db      - PostgreSQL 16 (persistence layer for all domain entities)
+#   redis   - Redis 7        (Celery broker + result backend)
+#   api     - FastAPI app    (HTTP surface; enqueues work, never sends inline)
+#   worker  - Celery worker  (consumes per-channel queues; performs delivery)
+#   beat    - Celery beat    (scheduler for `scheduled_at` notifications)
+#
+# WHY split api / worker / beat into 3 services from the same image:
+#   - Independent scaling (workers scale on queue depth, api on RPS).
+#   - Crash isolation (a poisoned task cannot take down the HTTP surface).
+#   - Matches Sprint 4 retry/backoff/scheduling responsibilities cleanly.
+# ---------------------------------------------------------------------------
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: notif_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-notif}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notif}
+      POSTGRES_DB: ${POSTGRES_DB:-notifications}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      # WHY: api/worker depend on a *ready* DB, not just a started container.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-notif} -d ${POSTGRES_DB:-notifications}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: notif_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: notif_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    # WHY run alembic in the api container's start command:
+    #   - Schema is brought to head exactly once per `docker compose up`.
+    #   - No separate migration job to forget. Idempotent (alembic no-ops if
+    #     already at head). For multi-replica prod deployments this would
+    #     move to a dedicated init job to avoid races.
+    command:
+      - "sh"
+      - "-c"
+      - "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: notif_worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # WHY -Q list:
+    #   - Each channel gets its own queue (§4.1) for failure isolation.
+    #   - `priority` is listed FIRST so the worker drains HIGH-priority
+    #     deliveries ahead of NORMAL/LOW (PRD §6 Sprint-4 nice-to-have).
+    #   - `scheduler` carries the periodic Beat scan task.
+    command:
+      - "celery"
+      - "-A"
+      - "app.worker.celery_app"
+      - "worker"
+      - "--loglevel=info"
+      - "-Q"
+      - "priority,email,sms,push,webhook,scheduler,default"
+
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: notif_beat
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command:
+      - "celery"
+      - "-A"
+      - "app.worker.celery_app"
+      - "beat"
+      - "--loglevel=info"
+
+volumes:
+  db_data:
+  redis_data:

@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------------------
+# Notification Service - Runtime Dependencies (Sprint 1 baseline)
+# ---------------------------------------------------------------------------
+# Pinned to compatible-release ranges (~=) to balance reproducibility with
+# patch-level security fixes. A `pip-compile` lockfile would be added in a
+# real deployment; out of scope for the exam.
+# ---------------------------------------------------------------------------
+
+# --- Web framework ---------------------------------------------------------
+fastapi~=0.115.0
+uvicorn[standard]~=0.32.0
+pydantic~=2.9.0
+pydantic-settings~=2.6.0          # 12-factor config via env vars (no hardcoding)
+
+# --- Persistence -----------------------------------------------------------
+SQLAlchemy~=2.0.36
+alembic~=1.13.3                   # schema migrations
+psycopg[binary]~=3.2.3            # modern Postgres driver (psycopg3)
+
+# --- Async queue / broker --------------------------------------------------
+celery~=5.4.0
+redis~=5.1.1                      # Celery broker + result backend client
+
+# --- Templating ------------------------------------------------------------
+Jinja2~=3.1.4                     # {{variable}} substitution (Sprint 3)
+
+# --- Observability ---------------------------------------------------------
+structlog~=24.4.0                 # structured logging w/ notification context
+
+# --- HTTP (webhook provider) ----------------------------------------------
+httpx~=0.27.2                     # async-capable HTTP client for webhook channel
+
+# --- Testing ---------------------------------------------------------------
+pytest~=8.3.3
+pytest-asyncio~=0.24.0
+httpx-ws~=0.6.2                   # not strictly required; trimmed if unused

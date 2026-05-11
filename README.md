@@ -2,7 +2,22 @@
 
 A production-shaped notification service that delivers messages over Email, SMS, Push, and Webhook channels with per-channel queues, retry-with-backoff, scheduling, frequency caps, user preferences, quiet-hours, templates, and a full per-channel state machine.
 
-Built end-to-end against the take-home spec in `mid-senior-notification-service.md`. Design rationale lives in `DECISIONS.md`; AI tooling notes live in `AI_USAGE.md`.
+Design rationale lives in `DECISIONS.md`; AI tooling notes live in `AI_USAGE.md`.
+
+---
+
+## Project Structure
+
+```
+notification-service/
+├── README.md
+├── AI_USAGE.md
+├── DECISIONS.md
+├── docker-compose.yml
+├── Dockerfile
+├── app/                  # application code
+└── tests/                # test suite
+```
 
 ---
 

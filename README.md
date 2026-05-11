@@ -14,10 +14,21 @@ Built end-to-end against the take-home spec in `mid-senior-notification-service.
 
 ### Boot the entire stack
 
+**Linux / macOS:**
+
 ```bash
-cp .env.example .env          # required — edit values as needed
+cp .env.example .env          # required — docker-compose has env_file: - .env
 docker compose up --build
 ```
+
+**Windows (PowerShell):**
+
+```powershell
+Copy-Item .env.example .env
+docker compose up --build
+```
+
+> ⚠️ The `.env` file is **mandatory** — `docker-compose.yml` declares `env_file: - .env`, so the `api`/`worker`/`beat` containers will fail to start without it. Copy from `.env.example` first.
 
 This starts five services:
 
@@ -33,7 +44,11 @@ Health check:
 
 ```bash
 curl http://localhost:8000/healthz
-# {"status":"ok"}
+# {"status":"ok"}                         — liveness; does NOT touch DB/Redis
+
+curl http://localhost:8000/readyz
+# {"status":"ok","components":{"database":{"status":"ok"},"redis":{"status":"ok"}}}
+# 503 (with the same body shape) if either dependency is down — readiness probe.
 ```
 
 OpenAPI docs: `http://localhost:8000/docs`.
@@ -50,14 +65,28 @@ All tunables live in `.env` (copied from `.env.example`). Key variables:
 
 | Variable | Default | Purpose |
 | -------- | ------- | ------- |
+| `LOG_LEVEL` | `INFO` | Logger level (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`) |
+| `LOG_JSON` | `true` | JSON-formatted logs (set `false` for human-readable dev logs) |
 | `MAX_RETRY_ATTEMPTS` | `5` | Max retries per Delivery before PERMANENTLY_FAILED |
 | `RETRY_BACKOFF_BASE_SECONDS` | `2` | Base for exponential backoff (doubles each retry, jittered) |
-| `FREQUENCY_CAP_HIGH_PRIORITY_BYPASS` | `true` | High-priority notifications bypass frequency caps |
+| `FREQUENCY_CAP_HIGH_PRIORITY_BYPASS` | `false` | When `true`, HIGH-priority notifications bypass frequency caps. Default is `false` (safer — combined with quiet-hours bypass, an unconstrained HIGH bypass turns any caller able to set `priority=high` into an unbounded firehose). |
+| `RATE_LIMITER_FAIL_OPEN` | `false` | Behaviour when the Redis cap-counter store is unreachable. `false` = drop the send (safer for alerting paths); `true` = allow the send and log. |
 | `SCHEDULED_SCAN_INTERVAL_SECONDS` | `30` | How often Celery Beat polls for due scheduled notifications |
+| `SCHEDULED_SCAN_BATCH_SIZE` | `200` | Max due notifications dispatched per scan tick |
 | `EMAIL_BOUNCE_RATE` | `0.05` | Fraction of email sends that simulate a hard bounce |
-| `EMAIL_TRANSIENT_FAILURE_RATE` | `0.05` | Fraction of email sends that simulate a retryable transient error |
-| `SMS_TRANSIENT_FAILURE_RATE` | `0.05` | Fraction of SMS sends that simulate a retryable carrier error |
-| `WEBHOOK_TRANSIENT_FAILURE_RATE` | `0.05` | Fraction of webhook POSTs that simulate a retryable 5xx |
+| `EMAIL_TRANSIENT_FAILURE_RATE` | `0.10` | Fraction of email sends that simulate a retryable transient error |
+| `EMAIL_OPEN_RATE` | `0.30` | P(simulated 'opened' event) given successful delivery |
+| `SMS_MAX_CHARS` | `160` | Per-message character ceiling; longer bodies are truncated |
+| `SMS_TRANSIENT_FAILURE_RATE` | `0.10` | Fraction of SMS sends that simulate a retryable carrier error |
+| `SMS_FAILED_RATE` | `0.02` | Fraction of SMS sends that simulate a non-retryable carrier rejection |
+| `PUSH_TRANSIENT_FAILURE_RATE` | `0.10` | Fraction of push sends that simulate a retryable FCM/APNs 5xx |
+| `PUSH_INVALID_TOKEN_RATE` | `0.03` | Fraction of push sends that simulate a non-retryable invalid/expired token |
+| `PUSH_CLICKED_RATE` | `0.20` | P(simulated 'clicked' event) given successful delivery |
+| `WEBHOOK_REQUEST_TIMEOUT_SECONDS` | `5.0` | HTTP timeout for the real webhook POST |
+| `WEBHOOK_BLOCK_PRIVATE_ADDRESSES` | `true` | SSRF guard: refuse webhook URLs that resolve to private/loopback/link-local/metadata IPs |
+| `WEBHOOK_FOLLOW_REDIRECTS` | `false` | If `true`, the webhook client follows 3xx redirects (disabled by default — a 3xx to a private IP would bypass the SSRF gate) |
+| `TASK_SOFT_TIME_LIMIT_SECONDS` | `30` | Per-task soft timeout (raises `SoftTimeLimitExceeded` → autoretry) |
+| `TASK_HARD_TIME_LIMIT_SECONDS` | `60` | Per-task hard timeout (worker child SIGKILL); must be `> soft` |
 | `DEFAULT_FREQUENCY_CAP_PER_HOUR` | `0` | Global default hourly cap (`0` = disabled) |
 | `DEFAULT_FREQUENCY_CAP_PER_DAY` | `0` | Global default daily cap (`0` = disabled) |
 
@@ -194,7 +223,7 @@ curl "http://localhost:8000/stats/deliveries?since=2026-01-01T00:00:00Z"
 
 ### 3.7 Resend failed deliveries (management)
 
-Resend re-enqueues every `Delivery` in state `failed` or `permanently_failed` for the given notification. Attempt counts are **reset to 0** so the full retry budget (`MAX_RETRY_ATTEMPTS`) is available again. Frequency caps are **not re-evaluated** — the original send already consumed the cap slot. Returns `202` with the list of re-queued `Delivery` objects.
+Resend re-enqueues every `Delivery` in state `failed` or `permanently_failed` for the given notification. The `attempts` counter is **NOT reset** — the operator opt-in is to grant additional attempts on top of recorded history (full audit trail preserved); the fresh enqueue starts a new retry cycle from the worker's perspective with `MAX_RETRY_ATTEMPTS` available again. Frequency caps are **not re-evaluated** — the original send already consumed the cap slot. Returns `202` with the list of re-queued `Delivery` objects.
 
 ```bash
 curl -X POST http://localhost:8000/notifications/<id>/resend

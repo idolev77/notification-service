@@ -108,6 +108,57 @@ def create_app() -> FastAPI:
         """Liveness probe. Cheap; does NOT touch DB or broker."""
         return {"status": "ok"}
 
+    @app.get("/readyz", tags=["meta"])
+    def readyz() -> dict[str, object]:
+        """
+        Readiness probe. Checks DB + Redis (broker / cap-counter store).
+
+        Returns 200 with per-dependency status when all checks pass; 503
+        otherwise. Suitable for Kubernetes readinessProbe / load-balancer
+        target-health checks (separate from /healthz so a broker hiccup
+        doesn't kill the container, only de-registers it from rotation).
+        """
+        from fastapi import HTTPException, status as http_status
+        from sqlalchemy import text
+
+        from app.core.config import get_settings
+
+        components: dict[str, dict[str, str]] = {}
+        overall_ok = True
+
+        # DB: cheap SELECT 1 through the engine pool.
+        try:
+            with get_engine().connect() as conn:
+                conn.execute(text("SELECT 1"))
+            components["database"] = {"status": "ok"}
+        except Exception as exc:  # noqa: BLE001
+            overall_ok = False
+            components["database"] = {"status": "error", "error": str(exc)[:200]}
+
+        # Redis (broker). We don't import celery here to keep the probe cheap.
+        try:
+            import redis as _redis
+
+            client = _redis.Redis.from_url(
+                get_settings().celery_broker_url, socket_timeout=2.0
+            )
+            client.ping()
+            components["redis"] = {"status": "ok"}
+        except Exception as exc:  # noqa: BLE001
+            overall_ok = False
+            components["redis"] = {"status": "error", "error": str(exc)[:200]}
+
+        body: dict[str, object] = {
+            "status": "ok" if overall_ok else "error",
+            "components": components,
+        }
+        if not overall_ok:
+            raise HTTPException(
+                status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=body,
+            )
+        return body
+
     app.include_router(notifications_router)
     app.include_router(templates_router)
     app.include_router(preferences_router)

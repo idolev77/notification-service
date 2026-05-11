@@ -140,7 +140,6 @@ def _persist_notification(
         # Per-channel template binding happens lazily in the dispatcher's
         # `_build_payload` — it has the (notification_type, channel) context
         # required to pick the right active template row.
-        template_id=None,
         variables=request.variables or {},
         priority=request.priority or NotificationPriority.NORMAL,
         status=NotificationStatus.RECEIVED,

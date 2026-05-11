@@ -37,10 +37,14 @@ class Notification(Base, TimestampMixin):
                                  Exactly one of these is populated; the API
                                  layer enforces XOR validation.
       - `notification_type`    → "Notification type"
-      - `content` /
-        `template_id`          → "Content / template reference"
-                                 Either inline `content` or a `template_id`
-                                 reference; XOR enforced at the API layer.
+      - `content`              → "Content / template reference"
+                                 Inline content. Templates are resolved
+                                 lazily by the dispatcher via
+                                 (notification_type, channel) lookup
+                                 because a single notification fans out
+                                 to multiple channels with different
+                                 per-channel templates (see DECISIONS.md
+                                 §1). No request-level `template_id`.
       - `variables`            → "Variables (for template substitution)"
       - `priority`             → "Priority (high, normal, low)"
       - `status`               → "Status (received, processing, completed, failed)"
@@ -81,15 +85,9 @@ class Notification(Base, TimestampMixin):
         index=True,
     )
 
-    # Inline body when no template is used. Mutually exclusive with template_id.
+    # Inline body. When NULL, the dispatcher resolves the active Template
+    # for (notification_type, channel) at delivery time.
     content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
-    # Optional FK to a Template. ON DELETE SET NULL preserves history if a
-    # template is removed after the notification was already accepted.
-    template_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("templates.id", ondelete="SET NULL"),
-        nullable=True,
-    )
 
     # JSONB so callers can pass arbitrary variable trees, e.g.
     #   {"user": {"name": "Ada"}, "order": {"id": 42}}

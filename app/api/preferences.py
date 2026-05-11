@@ -207,77 +207,9 @@ def _to_response(prefs: UserPreferences) -> UserPreferencesResponse:
 
 
 # ---------------------------------------------------------------------------
-# Pause / Resume — dedicated endpoints (PRD §3.5).
+# Pause / Resume (PRD §3.5).
 # ---------------------------------------------------------------------------
-# WHY a dedicated endpoint instead of "PUT /preferences with is_paused=true":
-#   - PUT is a full-replacement operation and requires an If-Match header.
-#     Forcing an operator to GET the current ETag, parse it, and replay the
-#     entire preferences document just to flip a single boolean is a
-#     terrible UX for what should be a single-call admin action ("pause Alice
-#     right now, she's getting alert-spammed").
-#   - The pause flag is a semantic action ("pause this user"), not a
-#     stateful resource edit. Modeling it as POST keeps the intent clear
-#     in audit logs and access-control rules.
-#   - We still take a row-level lock so a concurrent PUT cannot resurrect
-#     the row mid-flip. No If-Match required because the action is
-#     idempotent: pausing an already-paused user is a no-op.
-
-def _set_paused(
-    *, user_id: str, paused: bool, db: Session
-) -> UserPreferences:
-    """
-    Atomically flip the `is_paused` flag, locking the row so a concurrent
-    PUT /preferences cannot race us. Auto-creates an empty preferences row
-    if one does not yet exist (so an operator can preemptively pause a new
-    user before they have a configured profile).
-    """
-    from sqlalchemy import select as _select
-
-    prefs = db.execute(
-        _select(UserPreferences)
-        .where(UserPreferences.user_id == user_id)
-        .with_for_update()
-    ).scalar_one_or_none()
-
-    if prefs is None:
-        prefs = UserPreferences(user_id=user_id, is_paused=paused)
-        db.add(prefs)
-    else:
-        prefs.is_paused = paused
-
-    try:
-        db.commit()
-    except StaleDataError as exc:  # extremely unlikely under FOR UPDATE
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Preferences row changed concurrently; retry.",
-        ) from exc
-    db.refresh(prefs)
-    return prefs
-
-
-@router.post("/pause", response_model=UserPreferencesResponse)
-def pause_user(
-    response: Response,
-    user_id: str = _USER_ID_PATH,
-    db: Session = Depends(get_db_session),
-) -> UserPreferencesResponse:
-    """Pause all notifications for a user. Idempotent."""
-    prefs = _set_paused(user_id=user_id, paused=True, db=db)
-    attach_etag(response, prefs.version_id)
-    _logger.info("preferences.paused", user_id=user_id)
-    return _to_response(prefs)
-
-
-@router.post("/resume", response_model=UserPreferencesResponse)
-def resume_user(
-    response: Response,
-    user_id: str = _USER_ID_PATH,
-    db: Session = Depends(get_db_session),
-) -> UserPreferencesResponse:
-    """Resume notifications for a user. Idempotent."""
-    prefs = _set_paused(user_id=user_id, paused=False, db=db)
-    attach_etag(response, prefs.version_id)
-    _logger.info("preferences.resumed", user_id=user_id)
-    return _to_response(prefs)
+# These actions are exposed at `POST /users/{user_id}/pause` and
+# `POST /users/{user_id}/resume` by `app.api.management`. We do NOT also
+# mount them under `/users/{user_id}/preferences/pause` here — having a
+# single canonical URL avoids confusion in OpenAPI and audit logs.

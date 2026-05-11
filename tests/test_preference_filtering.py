@@ -247,12 +247,20 @@ def test_quiet_hours_start_equals_end_is_always_quiet() -> None:
     assert result.filtered_by_quiet_hours is True
 
 
-def test_high_priority_bypasses_frequency_cap_deny(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_high_priority_bypasses_frequency_cap_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    HIGH-priority notifications must bypass frequency caps entirely when
-    `frequency_cap_high_priority_bypass=True` (the default). The resolver
-    must not even call `check_and_consume` for HIGH-priority messages.
+    HIGH-priority notifications must bypass frequency caps when
+    `FREQUENCY_CAP_HIGH_PRIORITY_BYPASS=True`. The default is False
+    (documented in DECISIONS.md §3 step 6), so we explicitly enable the
+    bypass here and assert the resolver short-circuits BEFORE consulting
+    the limiter.
     """
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(
+        get_settings(), "frequency_cap_high_priority_bypass", True
+    )
+
     call_count = {"n": 0}
 
     def _deny(*, user_id: str, caps):  # noqa: ANN001, ARG001
@@ -273,3 +281,37 @@ def test_high_priority_bypasses_frequency_cap_deny(monkeypatch: pytest.MonkeyPat
     assert len(result.channels) > 0
     # Confirm bypass happened BEFORE calling the limiter.
     assert call_count["n"] == 0
+
+
+def test_quiet_hours_wraparound_overnight_window() -> None:
+    """
+    Edge case: an overnight quiet-hours window (start > end, e.g. 22:00 → 07:00)
+    must be detected correctly on BOTH sides of midnight. This is the
+    classic off-by-one that AI-generated branches get wrong (the inverted
+    `start < local_now < end` test would let 23:30 slip through).
+
+    We assert all four corners of the time-of-day:
+      - Inside, before midnight (23:30 local)  → quiet
+      - Inside, after midnight  (03:00 local)  → quiet
+      - Outside, late morning   (10:00 local)  → not quiet
+      - On the boundary at end  (07:00 local)  → not quiet (half-open interval)
+    """
+    prefs = _make_prefs(
+        quiet_start=time(22, 0),
+        quiet_end=time(7, 0),
+        quiet_tz="UTC",
+    )
+
+    def _resolve_at(hour: int, minute: int):
+        return resolve_channels_for_notification(
+            notification=_make_notification(priority=NotificationPriority.NORMAL),
+            user_pref=prefs,
+            channels_override=None,
+            now=datetime(2026, 1, 1, hour, minute, tzinfo=timezone.utc),
+        )
+
+    assert _resolve_at(23, 30).filtered_by_quiet_hours is True   # before midnight
+    assert _resolve_at(3, 0).filtered_by_quiet_hours is True     # after midnight
+    assert _resolve_at(10, 0).filtered_by_quiet_hours is False   # mid-morning
+    # Half-open `[start, end)` — exactly `end` is OUTSIDE the window.
+    assert _resolve_at(7, 0).filtered_by_quiet_hours is False

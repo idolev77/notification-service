@@ -164,8 +164,21 @@ def check_and_consume(
         script = _registered_script()
         result = script(keys=keys, args=args, client=_client())
     except RedisError as exc:
-        _logger.error("freqcap.redis_unavailable", error=str(exc), user_id=user_id)
-        return CapDecision(allowed=True)
+        # Behaviour controlled by `rate_limiter_fail_open`. Default = False
+        # (fail-closed) so a Redis outage cannot lift caps for every user
+        # simultaneously \u2014 which would be catastrophic for an alerting
+        # path. Operators on a marketing-only deployment can flip this on.
+        fail_open = get_settings().rate_limiter_fail_open
+        _logger.error(
+            "freqcap.redis_unavailable",
+            error=str(exc),
+            user_id=user_id,
+            fail_open=fail_open,
+        )
+        return CapDecision(
+            allowed=fail_open,
+            tripped_window=None if fail_open else "redis_unavailable",
+        )
 
     # Result is either {-1, tripped_idx} (deny) or [new_count_1, ...] (allow).
     if isinstance(result, list) and len(result) >= 1 and int(result[0]) == -1:

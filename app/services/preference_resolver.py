@@ -73,8 +73,21 @@ def resolve_channels_for_notification(
 
     `now` is injected for testability; defaults to wall-clock UTC.
     """
-    # Step 1 — explicit override wins, no filtering applied.
+    # Step 1 — explicit override wins over preference filtering, but pause
+    # is still honored: a paused user must not receive notifications even
+    # if the caller passes `channels_override`. Without this gate, override
+    # combined with HIGH priority would be effectively unconstrained.
     if channels_override:
+        if user_pref is not None and user_pref.is_paused:
+            _logger.info(
+                "preferences.override_blocked_by_pause",
+                user_id=user_pref.user_id,
+            )
+            return ResolutionResult(
+                channels=[],
+                used_override=True,
+                filtered_by_pause=True,
+            )
         return ResolutionResult(channels=list(channels_override), used_override=True)
 
     # Step 2 — no prefs / paused.

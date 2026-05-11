@@ -58,14 +58,32 @@ def _make_prefs(
     )
 
 
-def test_override_bypasses_all_filters() -> None:
-    result = resolve_channels_for_notification(
+def test_override_bypasses_quiet_hours_and_caps_but_not_pause() -> None:
+    """
+    `channels_override` is an admin escape hatch for things like password
+    resets and security alerts \u2014 it bypasses quiet hours and frequency
+    caps. It does NOT bypass an explicit pause: a paused user has
+    affirmatively opted out of all notifications, and override would
+    otherwise let any caller punch through that opt-out.
+    """
+    # Pause IS still honored even with override (security regression guard).
+    paused_result = resolve_channels_for_notification(
         notification=_make_notification(),
-        user_pref=_make_prefs(is_paused=True),  # pause is normally blocking
+        user_pref=_make_prefs(is_paused=True),
         channels_override=[ChannelType.EMAIL],
     )
-    assert result.used_override is True
-    assert result.channels == [ChannelType.EMAIL]
+    assert paused_result.used_override is True
+    assert paused_result.channels == []
+    assert paused_result.filtered_by_pause is True
+
+    # When the user is NOT paused, override bypasses all preference filtering.
+    ok_result = resolve_channels_for_notification(
+        notification=_make_notification(),
+        user_pref=_make_prefs(is_paused=False, enabled=()),  # nothing enabled
+        channels_override=[ChannelType.EMAIL],
+    )
+    assert ok_result.used_override is True
+    assert ok_result.channels == [ChannelType.EMAIL]
 
 
 def test_paused_user_yields_no_channels() -> None:

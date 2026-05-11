@@ -90,6 +90,15 @@ class Settings(BaseSettings):
 
     # Webhook (real HTTP POST against the configured URL).
     webhook_request_timeout_seconds: float = Field(default=5.0, gt=0.0, le=60.0)
+    # SSRF guard: block webhook URLs that resolve to private / loopback /
+    # link-local / reserved / multicast IP literals. Defaults to True
+    # (operators can disable for dev/loopback testing). Defends against a
+    # malicious user setting webhook_url to e.g. http://169.254.169.254/
+    # (AWS IMDS), http://127.0.0.1/, or RFC1918 internal services.
+    webhook_block_private_addresses: bool = Field(default=True)
+    # Follow redirects? Disabled by default — a 30x to a private IP would
+    # bypass the validation that we did on the original URL.
+    webhook_follow_redirects: bool = Field(default=False)
 
     # --- Frequency caps & scheduling (Sprint 4) --------------------------
     # Redis URL for the rate-limiter counters. Defaults to the same node as
@@ -100,9 +109,22 @@ class Settings(BaseSettings):
         description="Redis URL for frequency-cap counters.",
     )
     # If True, HIGH-priority notifications bypass frequency caps entirely.
-    # Documented in DECISIONS.md §3 step 6 — chosen to mirror the quiet-hours
-    # bypass: HIGH means "this is operationally critical".
-    frequency_cap_high_priority_bypass: bool = Field(default=True)
+    # Documented in DECISIONS.md §3 step 6.
+    #
+    # Default flipped to False (was True): combined with quiet-hours bypass,
+    # an unconstrained HIGH bypass turns any caller able to set
+    # priority=HIGH into an unbounded-throughput firehose. Operators who
+    # truly want this — and who control who can mint HIGH — can re-enable.
+    frequency_cap_high_priority_bypass: bool = Field(default=False)
+    # Behavior when the Redis cap-counter store is unreachable.
+    #   True  → fail OPEN (allow the send, log error). Reasonable for
+    #           best-effort marketing.
+    #   False → fail CLOSED (drop the send, mark FAILED). Safer for a
+    #           service that also carries operational alerts where one
+    #           Redis blip should not lift caps for every user at once.
+    # Default flipped to False; operators can opt back into fail-open per
+    # their risk profile.
+    rate_limiter_fail_open: bool = Field(default=False)
     # Global hard ceilings used as fallback when a user has no per-window
     # cap configured. `0` disables the fallback (no implicit cap).
     default_frequency_cap_per_hour: int = Field(default=0, ge=0)

@@ -88,7 +88,7 @@ def mark_delivery_permanently_failed(
         delivery.status = DeliveryStatus.PERMANENTLY_FAILED
         delivery.error_message = (error_message or "")[:4096]
         session.flush()
-        _recompute_notification_status(session, delivery.notification)
+        _recompute_notification_status(session, delivery)
         _logger.warning(
             "delivery.permanently_failed",
             delivery_id=str(delivery_id),
@@ -152,7 +152,7 @@ def _persist_attempt_success(delivery_id: uuid.UUID, outcome: SendOutcome) -> No
         delivery.provider_response = outcome.provider_response
         delivery.error_message = outcome.error_message
         session.flush()
-        _recompute_notification_status(session, delivery.notification)
+        _recompute_notification_status(session, delivery)
         _logger.info("delivery.delivered", status=delivery.status.value)
 
 
@@ -169,7 +169,7 @@ def _persist_attempt_failure(delivery_id: uuid.UUID, *, error: str) -> None:
         delivery.status = DeliveryStatus.FAILED
         delivery.error_message = (error or "")[:4096]
         session.flush()
-        _recompute_notification_status(session, delivery.notification)
+        _recompute_notification_status(session, delivery)
 
 
 # ---------------------------------------------------------------------------
@@ -311,28 +311,57 @@ class _InlineTemplate:
 
 
 def _recompute_notification_status(
-    session: Session, notification: Notification
+    session: Session, delivery: Delivery
 ) -> None:
     """
     Aggregate per-channel Delivery statuses into the top-level Notification.
+
+    Concurrency:
+      Multiple workers may finish sibling Deliveries on the same
+      Notification at roughly the same time. Each calls this function in
+      its own TX2. Without serialization, two writers can compute the
+      aggregate against stale snapshots and clobber each other's status
+      update (a write-write race). We defend with `SELECT ... FOR UPDATE`
+      on the parent Notification row — this serializes only the aggregate
+      step, not the (long) provider call. Sibling Delivery rows are read
+      back fresh inside the same TX so the aggregate is computed against
+      committed truth.
 
     Rules (PRD §4.1 + §4.4 failure isolation):
       - Any non-terminal Delivery → PROCESSING.
       - All terminal AND at least one DELIVERED → COMPLETED.
       - All terminal AND none DELIVERED → FAILED.
     """
-    statuses = [d.status for d in notification.deliveries]
+    # Take a row-level lock on the parent Notification. Any concurrent
+    # worker doing the same recompute will block here until we COMMIT.
+    notification = session.execute(
+        select(Notification)
+        .where(Notification.id == delivery.notification_id)
+        .with_for_update()
+    ).scalar_one()
+
+    # Re-read sibling deliveries inside the locked TX so the aggregate is
+    # consistent with the latest committed state, not a stale identity-map
+    # snapshot from before the lock.
+    sibling_statuses = list(
+        session.execute(
+            select(Delivery.status).where(
+                Delivery.notification_id == notification.id
+            )
+        ).scalars()
+    )
+
     terminal = {
         DeliveryStatus.DELIVERED,
         DeliveryStatus.PERMANENTLY_FAILED,
         DeliveryStatus.CANCELLED,
     }
 
-    if not statuses or any(s not in terminal for s in statuses):
+    if not sibling_statuses or any(s not in terminal for s in sibling_statuses):
         notification.status = NotificationStatus.PROCESSING
         return
 
-    if any(s is DeliveryStatus.DELIVERED for s in statuses):
+    if any(s is DeliveryStatus.DELIVERED for s in sibling_statuses):
         notification.status = NotificationStatus.COMPLETED
     else:
         notification.status = NotificationStatus.FAILED

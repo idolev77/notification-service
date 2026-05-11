@@ -122,8 +122,8 @@ pytest -q
 Expected output:
 
 ```
-....................                                                     [100%]
-20 passed in ~2s
+............................................................             [100%]
+44 passed in ~2s
 ```
 
 The 6 mandatory test files map to PRD §7.5 as follows:
@@ -314,9 +314,8 @@ Failure simulation rates are tunable via env vars (see `.env.example`) so tests 
 ```
 py_exam/
 ├── README.md            ← this file
-├── AI_USAGE.md          ← AI tooling reflection (PRD §7.4)
-├── DECISIONS.md         ← design decisions (PRD §7.3)
-├── PRD.md               ← spec & sprint checklist (internal)
+├── AI_USAGE.md          ← AI tooling reflection
+├── DECISIONS.md         ← design decisions
 ├── docker-compose.yml   ← api + worker + beat + db + redis
 ├── Dockerfile           ← Python 3.11+ slim, non-root user
 ├── alembic/             ← schema migrations
@@ -337,4 +336,3 @@ py_exam/
 
 - **Design rationale** (channel abstraction, retry strategy, preference resolution order, multi-channel coordination, what I'd do differently) → `DECISIONS.md`
 - **AI tooling notes** → `AI_USAGE.md`
-- **Spec & sprint checklist** → `PRD.md`

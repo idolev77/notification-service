@@ -47,6 +47,24 @@ from sqlalchemy import select
 _logger = get_logger(__name__)
 
 
+class DeliveryAlreadyClaimedError(Exception):
+    """
+    Raised when a competing worker holds the row-level lock on this Delivery
+    (i.e. `SELECT ... FOR UPDATE SKIP LOCKED` returned no row even though
+    the delivery exists). The current worker should ack the message and
+    let the holder finish — re-attempting now would simply re-deliver to
+    the user.
+    """
+
+
+class DeliveryAlreadyTerminalError(Exception):
+    """
+    Raised when the row is locked successfully but its status is already
+    terminal (DELIVERED / PERMANENTLY_FAILED / CANCELLED). The Celery task
+    should ack and exit silently — work is done.
+    """
+
+
 def execute_delivery_attempt(
     *, delivery_id: uuid.UUID, channel: ChannelType
 ) -> None:
@@ -57,7 +75,31 @@ def execute_delivery_attempt(
     Time complexity: O(1) DB ops + O(provider). Space: O(1).
     """
     # --- TX1: claim the delivery (QUEUED/FAILED → SENDING) -----------------
-    payload, provider_cls = _claim_delivery_for_attempt(delivery_id, channel)
+    try:
+        claim = _claim_delivery_for_attempt(delivery_id, channel)
+    except DeliveryAlreadyClaimedError:
+        # Another worker is mid-attempt on this exact row. Drop this
+        # message — the holder will write the terminal outcome.
+        _logger.info(
+            "delivery.skipped_concurrent_claim",
+            delivery_id=str(delivery_id),
+        )
+        return
+    except DeliveryAlreadyTerminalError as exc:
+        _logger.info(
+            "delivery.skipped_already_terminal",
+            delivery_id=str(delivery_id),
+            current_status=str(exc),
+        )
+        return
+
+    if claim is None:
+        # Row was abandoned by a crashed worker AND retry budget is gone.
+        # Already marked PERMANENTLY_FAILED inside the claim TX — nothing
+        # more to do here.
+        return
+
+    payload, provider_cls = claim
     provider = provider_cls()
 
     # --- Provider call OUTSIDE any open transaction ------------------------
@@ -102,16 +144,90 @@ def mark_delivery_permanently_failed(
 
 def _claim_delivery_for_attempt(
     delivery_id: uuid.UUID, channel: ChannelType
-) -> tuple[SendPayload, type[ChannelProvider]]:
+) -> tuple[SendPayload, type[ChannelProvider]] | None:
     """
     TX1: flip Delivery to SENDING, increment attempts, build payload.
+
+    Concurrency guard:
+      - Acquires a row-level lock with `SELECT ... FOR UPDATE SKIP LOCKED`.
+        If another worker holds the row (broker redelivered the same task
+        to two consumers) the SELECT returns no row and we raise
+        `DeliveryAlreadyClaimedError` so the caller can ack the duplicate.
+      - If the row is already in a terminal state, raise
+        `DeliveryAlreadyTerminalError`. Same outcome — the duplicate Celery
+        message is acked and discarded.
+
+    Crash recovery:
+      - If the row is in `SENDING` (a previous worker committed TX1 then
+        died before TX2), treat this delivery as a fresh attempt:
+        increment `attempts` and update `last_attempt_at`. The previous
+        attempt produced no provider record so it cannot be double-counted.
+      - If `attempts` already equals `max_retries`, do NOT call the provider
+        again — mark the delivery PERMANENTLY_FAILED (as if Celery's retry
+        budget was exhausted) and return `None` so the caller exits.
 
     Returns the SendPayload + the registered provider class so the caller
     can perform the (long-running) provider call without holding a tx.
     """
+    from app.core.config import get_settings as _get_settings  # local: avoid cycle
+
     with session_scope() as session:
-        delivery = _load_delivery(session, delivery_id)
-        notification = delivery.notification
+        # SKIP LOCKED — if a concurrent worker already holds this row, the
+        # SELECT returns nothing rather than blocking. Distinguishing
+        # "row missing" from "row locked" requires a second probe without
+        # the lock hint.
+        locked = session.execute(
+            select(Delivery)
+            .where(Delivery.id == delivery_id)
+            .with_for_update(skip_locked=True)
+        ).scalar_one_or_none()
+
+        if locked is None:
+            # Either the row does not exist OR another worker holds it.
+            exists = session.execute(
+                select(Delivery.id).where(Delivery.id == delivery_id)
+            ).scalar_one_or_none()
+            if exists is None:
+                raise LookupError(f"Delivery {delivery_id} not found.")
+            raise DeliveryAlreadyClaimedError(str(delivery_id))
+
+        delivery = locked
+        notification = delivery.notification  # eager-load before mutating
+
+        # Terminal short-circuit — duplicate Celery message after the
+        # holder already wrote the final outcome.
+        if delivery.status in (
+            DeliveryStatus.DELIVERED,
+            DeliveryStatus.PERMANENTLY_FAILED,
+            DeliveryStatus.CANCELLED,
+        ):
+            raise DeliveryAlreadyTerminalError(delivery.status.value)
+
+        # Crash-recovery path: previous worker committed SENDING then died.
+        if delivery.status is DeliveryStatus.SENDING:
+            max_retries = _get_settings().max_retry_attempts
+            if delivery.attempts >= max_retries:
+                # Retry budget gone — terminal-fail in this very TX so the
+                # parent Notification's aggregate status is recomputed
+                # synchronously and the message is acked.
+                delivery.status = DeliveryStatus.PERMANENTLY_FAILED
+                delivery.error_message = (
+                    "Recovered from stale SENDING after worker crash; "
+                    "retry budget exhausted."
+                )[:4096]
+                session.flush()
+                _recompute_notification_status(session, delivery)
+                _logger.warning(
+                    "delivery.recovered_stale_sending_terminal",
+                    delivery_id=str(delivery_id),
+                    attempts=delivery.attempts,
+                )
+                return None
+            _logger.info(
+                "delivery.recovered_from_stale_sending",
+                delivery_id=str(delivery_id),
+                attempts=delivery.attempts,
+            )
 
         bind_notification_context(
             notification_id=str(notification.id),

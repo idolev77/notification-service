@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -84,6 +84,25 @@ class SendNotificationResponse(BaseModel):
     status: NotificationStatus
     scheduled_at: datetime | None = None
     created_at: datetime
+    # Drop signalling — see DECISIONS.md §4 / Design Gap fix.
+    # `is_dropped=True` means the API accepted and persisted the notification
+    # but no Delivery rows were created (legitimate user-state filter).
+    # Infrastructure failures (e.g. Redis cap-evaluator unavailable when
+    # `rate_limiter_fail_open=False`) are NOT reported here — they short
+    # the request to HTTP 503 with a `Retry-After` header instead.
+    is_dropped: bool = False
+    drop_reason: Literal[
+        "paused",
+        "quiet_hours",
+        "frequency_cap",
+        "no_enabled_channels",
+        "no_resolvable_address",
+        "missing_preferences",
+    ] | None = None
+    drop_detail: str | None = Field(
+        default=None,
+        description="Free-form context for `drop_reason` (e.g. tripped window).",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +178,11 @@ class BatchSendItemResult(BaseModel):
     # On success:
     notification_id: uuid.UUID | None = None
     status: NotificationStatus | None = None
+    # Drop signalling (mirrors `SendNotificationResponse`); set when the
+    # request was accepted but no deliveries were created.
+    is_dropped: bool = False
+    drop_reason: str | None = None
+    drop_detail: str | None = None
     # On failure:
     error: str | None = None
 

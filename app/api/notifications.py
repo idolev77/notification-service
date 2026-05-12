@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Path, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Response, status
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -26,11 +27,36 @@ from app.schemas.notifications import (
     SendNotificationRequest,
     SendNotificationResponse,
 )
-from app.services.notifications import create_and_dispatch_notification
+from app.services.notifications import (
+    InfrastructureUnavailableError,
+    create_and_dispatch_notification,
+)
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
 _logger = get_logger(__name__)
+
+# How long the client should wait before retrying a 503 caused by an
+# unavailable infrastructure dependency. Short — most outages are sub-minute.
+_RETRY_AFTER_SECONDS = "5"
+
+
+def _build_send_response(notification) -> SendNotificationResponse:  # noqa: ANN001
+    """
+    Build a `SendNotificationResponse`, propagating any transient drop
+    annotations the service layer attached to the Notification instance.
+    """
+    drop_reason = getattr(notification, "_drop_reason", None)
+    drop_detail = getattr(notification, "_drop_detail", None)
+    return SendNotificationResponse(
+        id=notification.id,
+        status=notification.status,
+        scheduled_at=notification.scheduled_at,
+        created_at=notification.created_at,
+        is_dropped=drop_reason is not None,
+        drop_reason=drop_reason,
+        drop_detail=drop_detail,
+    )
 
 
 @router.post(
@@ -42,6 +68,7 @@ _logger = get_logger(__name__)
 )
 def send_notification(
     request: SendNotificationRequest,
+    response: Response,
     db: Session = Depends(get_db_session),
 ) -> SendNotificationResponse:
     """
@@ -49,10 +76,38 @@ def send_notification(
 
     Returns immediately with the persisted Notification's id and current
     status. Clients poll the tracking endpoints (Sprint 5) for progress.
+
+    Failure semantics:
+      - 422  Pydantic / domain validation errors.
+      - 503  Critical infra dependency unavailable (e.g. Redis cap-evaluator
+             with `rate_limiter_fail_open=False`). Retry-After header set.
+             Nothing is persisted; clients can safely retry.
+      - 500  Persistence failure (DB).
+      - 202  Accepted. May carry `is_dropped=true` + `drop_reason` when the
+             request was valid but no Deliveries were created (paused user,
+             quiet hours, frequency cap, etc.).
     """
     try:
         notification = create_and_dispatch_notification(session=db, request=request)
         db.commit()
+    except InfrastructureUnavailableError as exc:
+        # Roll back any pre-resolution work and signal the caller to retry.
+        # Returning a silent 202 here would let security-critical sends
+        # (password resets, fraud alerts) disappear into a black hole.
+        db.rollback()
+        _logger.warning(
+            "notification.dropped_infrastructure_unavailable",
+            reason=exc.reason,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "infrastructure_unavailable",
+                "reason": exc.reason,
+                "message": exc.detail or str(exc),
+            },
+            headers={"Retry-After": _RETRY_AFTER_SECONDS},
+        ) from exc
     except ValueError as exc:
         # Domain-level validation errors map to 422.
         db.rollback()
@@ -69,12 +124,7 @@ def send_notification(
             detail="Failed to persist notification.",
         )
 
-    return SendNotificationResponse(
-        id=notification.id,
-        status=notification.status,
-        scheduled_at=notification.scheduled_at,
-        created_at=notification.created_at,
-    )
+    return _build_send_response(notification)
 
 
 def _merge_variables(
@@ -134,7 +184,20 @@ def send_notification_batch(
                 )
             item.notification_id = notification.id
             item.status = notification.status
+            # Surface drop signalling per-recipient (mirrors the single-send
+            # endpoint so batch callers also see why a recipient was dropped).
+            drop_reason = getattr(notification, "_drop_reason", None)
+            if drop_reason is not None:
+                item.is_dropped = True
+                item.drop_reason = drop_reason
+                item.drop_detail = getattr(notification, "_drop_detail", None)
             accepted += 1
+        except InfrastructureUnavailableError as exc:
+            # Infra failures are NOT counted as accepted. Mirror the
+            # single-send 503 semantics inside a 207 batch by recording
+            # the error per-recipient. Caller can retry the failed subset.
+            item.error = f"infrastructure_unavailable:{exc.reason}"
+            failed += 1
         except ValueError as exc:
             item.error = str(exc)
             failed += 1
@@ -174,6 +237,19 @@ def cancel_scheduled_notification(
     """
     Cancel a notification that is still in the RECEIVED + scheduled state.
 
+    Concurrency:
+      The scheduler claims due notifications via
+      `SELECT ... FOR UPDATE SKIP LOCKED` and flips RECEIVED → PROCESSING
+      before fanning out per-channel tasks. Without a symmetric lock here,
+      a cancel issued at the same instant as a scheduler tick could read
+      `status=RECEIVED` from a stale snapshot and write `CANCELLED` AFTER
+      the scheduler has already enqueued the deliveries — the API would
+      lie to the caller. We acquire `SELECT ... FOR UPDATE` on the same
+      Notification row so the cancel and the scheduler claim serialize on
+      whichever transaction grabs the row first. The loser sees the
+      committed PROCESSING status after the winner releases and refuses
+      with 409.
+
     Rules:
       - Only `RECEIVED` notifications with a `scheduled_at` can be cancelled.
         Anything PROCESSING/COMPLETED/FAILED is past the point of no return
@@ -181,7 +257,12 @@ def cancel_scheduled_notification(
       - Cascade: marking the parent CANCELLED is sufficient; the scheduler
         only picks up RECEIVED rows so the queued Deliveries are skipped.
     """
-    notification = db.get(Notification, notification_id)
+    # Acquire a row-level lock BEFORE reading status. Held until commit/rollback.
+    notification = db.execute(
+        select(Notification)
+        .where(Notification.id == notification_id)
+        .with_for_update()
+    ).scalar_one_or_none()
     if notification is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -192,6 +273,8 @@ def cancel_scheduled_notification(
             status_code=status.HTTP_409_CONFLICT,
             detail="Only scheduled notifications can be cancelled.",
         )
+    # Re-check status under the lock — between request arrival and lock
+    # acquisition, the scheduler may have flipped the row to PROCESSING.
     if notification.status is not NotificationStatus.RECEIVED:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -213,9 +296,4 @@ def cancel_scheduled_notification(
     db.refresh(notification)
     _logger.info("notification.cancelled", notification_id=str(notification.id))
 
-    return SendNotificationResponse(
-        id=notification.id,
-        status=notification.status,
-        scheduled_at=notification.scheduled_at,
-        created_at=notification.created_at,
-    )
+    return _build_send_response(notification)

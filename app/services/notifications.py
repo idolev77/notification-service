@@ -40,6 +40,23 @@ from app.tasks.deliver import enqueue_delivery
 _logger = get_logger(__name__)
 
 
+class InfrastructureUnavailableError(RuntimeError):
+    """
+    Raised when the dispatch pipeline cannot make a defensible decision
+    because a critical dependency (currently: the Redis frequency-cap
+    evaluator under fail-closed configuration) is unreachable.
+
+    The API layer translates this into HTTP 503 with a `Retry-After` header
+    rather than silently persisting a `COMPLETED` notification — see
+    DECISIONS.md §4 / Design Gap fix.
+    """
+
+    def __init__(self, *, reason: str, detail: str | None = None) -> None:
+        super().__init__(f"infrastructure_unavailable:{reason}")
+        self.reason = reason
+        self.detail = detail
+
+
 def create_and_dispatch_notification(
     *, session: Session, request: SendNotificationRequest
 ) -> Notification:
@@ -49,17 +66,55 @@ def create_and_dispatch_notification(
     Caller (API handler) is responsible for committing the session AFTER
     this returns — keeps the unit-of-work boundary visible in the route.
 
+    The returned `Notification` may carry transient drop-signal attributes
+    (`_drop_reason`, `_drop_detail`) populated when no Deliveries were
+    created. The API layer surfaces these in the response body.
+
     Time complexity: O(channels). Space: O(channels).
     """
     user_pref = _load_user_preferences(session, request.recipient_user_id)
-    notification = _persist_notification(session, request)
-    bind_notification_context(notification_id=str(notification.id))
 
+    # Resolve channels FIRST so we can fail-fast on infrastructure errors
+    # WITHOUT having persisted a Notification row that would lie in the
+    # audit trail. A throw-away Notification object is needed to feed the
+    # resolver (it reads `notification_type` and `priority`); we only
+    # call `session.add` once we know the resolution succeeded.
+    transient = Notification(
+        recipient_user_id=request.recipient_user_id,
+        recipient_contact=request.recipient_contact,
+        notification_type=request.notification_type,
+        content=request.content,
+        variables=request.variables or {},
+        priority=request.priority or NotificationPriority.NORMAL,
+        status=NotificationStatus.RECEIVED,
+        scheduled_at=request.scheduled_at,
+    )
     resolution = resolve_channels_for_notification(
-        notification=notification,
+        notification=transient,
         user_pref=user_pref,
         channels_override=request.channels_override,
     )
+
+    # Infrastructure failure (e.g. Redis cap-evaluator down + fail-closed)
+    # surfaces via the resolver as a frequency-cap drop tagged with
+    # `redis_unavailable`. Do NOT persist the notification; raise so the
+    # API returns 503 + Retry-After.
+    if (
+        resolution.filtered_by_frequency_cap
+        and resolution.tripped_cap_window == "redis_unavailable"
+    ):
+        _logger.error(
+            "notification.infrastructure_unavailable",
+            reason="redis_unavailable",
+            recipient_user_id=request.recipient_user_id,
+        )
+        raise InfrastructureUnavailableError(
+            reason="frequency_cap_evaluator_unavailable",
+            detail="Frequency-cap evaluator (Redis) is unreachable.",
+        )
+
+    notification = _persist_notification(session, request)
+    bind_notification_context(notification_id=str(notification.id))
 
     # Empty resolution is a legitimate outcome (paused user, quiet hours,
     # missing preferences). We persist a deliveries-free Notification and
@@ -80,7 +135,9 @@ def create_and_dispatch_notification(
     # Every chosen channel could still fall through if it had no resolvable
     # address (e.g. user has WEBHOOK in enabled_channels but no webhook_url).
     if not deliveries:
-        _finalize_filtered_notification(notification, resolution)
+        _finalize_filtered_notification(
+            notification, resolution, address_drop=True
+        )
         return notification
 
     # Flush so Delivery PKs are assigned before we hand them to Celery.
@@ -218,14 +275,26 @@ def _resolve_recipient_address(
 
 
 def _finalize_filtered_notification(
-    notification: Notification, resolution: ResolutionResult
+    notification: Notification,
+    resolution: ResolutionResult,
+    *,
+    address_drop: bool = False,
 ) -> None:
     """
     Mark a notification that produced zero deliveries as terminally COMPLETED
     and emit a structured log explaining which filter rejected it. This is
     intentionally NOT FAILED: nothing went wrong; the user simply opted out.
+
+    Also tags the notification with transient `_drop_reason` / `_drop_detail`
+    attributes so the API layer can surface a non-silent 202 — see
+    DECISIONS.md §4 / Design Gap fix.
     """
     notification.status = NotificationStatus.COMPLETED
+    reason, detail = _classify_drop(resolution, address_drop=address_drop)
+    # SQLAlchemy ORM instances accept arbitrary attribute assignment; using
+    # underscore-prefixed names keeps these out of the mapped column space.
+    notification._drop_reason = reason  # type: ignore[attr-defined]
+    notification._drop_detail = detail  # type: ignore[attr-defined]
     _logger.info(
         "notification.filtered",
         notification_id=str(notification.id),
@@ -235,4 +304,24 @@ def _finalize_filtered_notification(
         filtered_by_frequency_cap=resolution.filtered_by_frequency_cap,
         tripped_cap_window=resolution.tripped_cap_window,
         missing_preferences=resolution.missing_preferences,
+        drop_reason=reason,
     )
+
+
+def _classify_drop(
+    resolution: ResolutionResult, *, address_drop: bool
+) -> tuple[str | None, str | None]:
+    """Map a resolver outcome to the API-visible (drop_reason, drop_detail) pair."""
+    if resolution.filtered_by_pause:
+        return "paused", None
+    if resolution.filtered_by_quiet_hours:
+        return "quiet_hours", None
+    if resolution.filtered_by_frequency_cap:
+        return "frequency_cap", resolution.tripped_cap_window
+    if resolution.missing_preferences:
+        return "missing_preferences", None
+    if address_drop:
+        return "no_resolvable_address", None
+    # Empty `enabled_channels` (or per-type narrowed to empty) — user has
+    # not opted in to any channel for this notification type.
+    return "no_enabled_channels", None

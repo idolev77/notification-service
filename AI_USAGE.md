@@ -4,6 +4,8 @@
 
 - **GitHub Copilot Chat (Claude-class assistant)** in VS Code — primary pair-programmer for the entire build. Used as a Spec-Driven-Development partner: every sprint started by handing it the relevant PRD section and asking it to act on the spec, not on intuition.
 - **GitHub Copilot inline completions** — for boilerplate (Pydantic field definitions, repetitive Celery task wrappers, dataclass scaffolding).
+- **Custom QA agent (race-condition specialist)** — a dedicated agent persona instructed to treat every shared mutable state as a suspect: Redis counters, SQLAlchemy session boundaries, Celery task retries, and ETag reads. Its sole job was to probe for TOCTOU gaps, lost-update windows, and double-delivery scenarios before each sprint was closed.
+- **Custom strict-examiner agent** — an agent persona that was given only the original assignment (`mid-senior-notification-service.md`) and no access to the codebase. After every significant update I ran an EVAL pass: the examiner would read only the public-facing spec and score the visible behaviour against the requirements, exactly as a human grader would. This caught several gaps (missing status codes, undocumented edge cases) that the implementation-side agents missed because they were too close to the code.
 
 ## What Helped Most
 

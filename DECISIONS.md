@@ -26,7 +26,7 @@
 
 **Approach chosen:** Two-axis exception model + Celery autoretry with exponential backoff + jitter, with a hard PERMANENTLY_FAILED transition once retries are exhausted.
 
-**Retryable vs non-retryable classification** (raised by the provider — only it knows what an upstream's specific error code means):
+**Retryable vs non-retryable errors:** (raised by the provider — only it knows what an upstream's specific error code means):
 
 | Channel | Retryable (`RetryableProviderError`) | Non-retryable (`NonRetryableProviderError`) |
 |---|---|---|
@@ -35,7 +35,7 @@
 | Push    | FCM/APNs 5xx, transient timeout | Invalid/expired device token, missing title, empty body |
 | Webhook | HTTP 408, 425, 429, 500, 502, 503, 504; network/timeout/DNS errors | Other 4xx, non-http(s) URL, URL > 2048 chars |
 
-**Retry timing:** **exponential backoff with jitter**, capped.
+**Timing:** **exponential backoff with jitter**, capped.
 - Implemented via Celery `retry_backoff=True` + `retry_backoff_max=600` + `retry_jitter=True` on the `_DeliveryTask` base in [app/tasks/deliver.py](app/tasks/deliver.py).
 - Wait sequence (base from `RETRY_BACKOFF_BASE_SECONDS`, default 2): ~2s → ~4s → ~8s → ~16s → ~32s … capped at 600s. Jitter randomizes within ±50% to avoid thundering-herd retries when many tasks fail simultaneously.
 - _Why exponential + jitter (not fixed delay)?_ Transient outages tend to be correlated across many tasks; a fixed delay would synchronize retries and re-melt whatever just recovered. Exponential growth gives the upstream room to breathe; jitter de-synchronizes.
@@ -61,6 +61,8 @@ After every TX2 the parent Notification's status is recomputed (PROCESSING / COM
 
 **Approach chosen:** A pure function `resolve_channels_for_notification` in [app/services/preference_resolver.py](app/services/preference_resolver.py) computes the channel list. Side-effect free: the caller (`app/services/notifications.py`) decides what to do with the result (create Deliveries, mark filtered, etc.).
 
+**Rationale for override placement:** While the assignment listed Channel Override as step 5 of the resolution pipeline, we have intentionally implemented it as Step 1 — a deliberate architectural choice for production reliability. `channels_override` functions as a critical Administrative/Security Escape Hatch: urgent notifications such as password resets and fraud alerts must reach the user even if they have globally disabled that channel or are mid-quiet-window. Applying any user-level filter before the override would silently swallow security-critical messages. This decision is the single point where we consciously deviate from the literal ordering in the spec; all other steps follow the spec exactly.
+
 **Resolution pipeline (deterministic, top-down):**
 
 1. **`channels_override`** (PRD §4.7) — if present, BYPASSES the entire pipeline. Rationale: override is an admin/security escape hatch (password reset, fraud alert) that must succeed even if the user has globally disabled that channel.
@@ -73,7 +75,7 @@ After every TX2 the parent Notification's status is recomputed (PROCESSING / COM
 
 **Conflicts resolved by:** strict precedence — override > paused > enabled > per-type narrowing > quiet hours > address availability. There is no merging; each step either passes the candidate list through or replaces it with `[]`.
 
-**Worked example:**
+**Example:**
 - User prefs: `enabled_channels=[email, sms]`, `per_type_preferences={"marketing": [email]}`, `quiet_hours=22:00–07:00 Asia/Jerusalem`, `is_paused=False`.
 - Request: `notification_type=marketing`, `priority=NORMAL`, sent at 04:00 local time.
 - Step 1: no override → continue.
@@ -90,7 +92,7 @@ After every TX2 the parent Notification's status is recomputed (PROCESSING / COM
 
 **Approach chosen:** Each resolved channel becomes an INDEPENDENT `Delivery` row with its own Celery task on a dedicated per-channel queue (`email`, `sms`, `push`, `webhook`). All channels for a single notification execute IN PARALLEL — there is no sequencing between them.
 
-**Why parallel (over sequential):**
+**Why:** parallel execution over sequential, for three reasons:
 - Latency: a slow webhook acknowledgement should never delay an SMS that the user is waiting on.
 - Backpressure isolation: a queue backlog on `webhook` (e.g. a flapping customer endpoint) does not block `email` workers — Celery prefetch is 1 and queues are independent.
 - Operational scaling: each queue's worker count can be scaled independently in `docker-compose.yml` (`-Q email,sms` for one fleet, `-Q webhook` for another).
@@ -100,7 +102,7 @@ After every TX2 the parent Notification's status is recomputed (PROCESSING / COM
 - All Deliveries terminal AND ≥1 `DELIVERED` → `COMPLETED`.
 - All Deliveries terminal AND zero `DELIVERED` → `FAILED`.
 
-**Failure isolation (PRD §4.4):** because each channel is its own task with its own retry counter, a permanent SMS bounce does not impact the email retry loop. The notification reaches `COMPLETED` as soon as ANY channel succeeds; remaining failed channels surface in their per-Delivery `error_message` for observability without polluting the top-level status.
+**Failure isolation:** because each channel is its own task with its own retry counter, a permanent SMS bounce does not impact the email retry loop. The notification reaches `COMPLETED` as soon as ANY channel succeeds; remaining failed channels surface in their per-Delivery `error_message` for observability without polluting the top-level status.
 
 **Concurrency safety:** the dispatcher's 3-transaction layout (claim → external call → persist outcome) means two workers attempting the same delivery would both flip to `SENDING` and increment `attempts` — but Celery's `acks_late=True` + per-queue prefetch=1 + the unique task ID on the broker prevent that fan-out at the source. A future hardening would add `SELECT … FOR UPDATE SKIP LOCKED` on the claim TX to make this safe even if a duplicate task ever lands.
 

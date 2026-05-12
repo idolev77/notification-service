@@ -23,8 +23,7 @@ Resolution order (deterministic — see DECISIONS.md §3):
           window AND the notification is not HIGH priority, drop ALL
           channels. HIGH priority bypasses quiet hours unconditionally.
 
-  Step 6. Frequency-cap enforcement (PRD §4.6) — Sprint 4 only; this
-          resolver records the caps but does not enforce them.
+  Step 6. Frequency-cap enforcement (PRD §4.6).
 
   Step 7. WEBHOOK requires a configured `user_pref.webhook_url`; if absent
           the channel is dropped (logged) so we never ship a webhook
@@ -121,7 +120,7 @@ def resolve_channels_for_notification(
         return ResolutionResult(channels=[], filtered_by_quiet_hours=True)
 
     # Step 6 — frequency caps (PRD §4.6). HIGH priority bypasses when
-    # `frequency_cap_high_priority_bypass` is enabled (default true) —
+    # `frequency_cap_high_priority_bypass` is enabled (default false) —
     # documented in DECISIONS §3 step 6.
     cap_decision = _check_frequency_caps(user_pref=user_pref, is_high=is_high)
     if not cap_decision.allowed:
